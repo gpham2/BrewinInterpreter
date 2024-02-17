@@ -2,15 +2,14 @@ import copy
 from enum import Enum
 
 from brewparse import parse_program
-from env_v3 import EnvironmentManager
+from env_v4 import EnvironmentManager
 from intbase import InterpreterBase, ErrorType
-from type_valuev3 import Closure, Type, Value, create_value, get_printable
+from type_valuev4 import Closure, Object, Type, Value, create_value, get_printable, UNDEFINED
 
 
 class ExecStatus(Enum):
     CONTINUE = 1
     RETURN = 2
-
 
 # Main interpreter class
 class Interpreter(InterpreterBase):
@@ -24,12 +23,28 @@ class Interpreter(InterpreterBase):
         super().__init__(console_output, inp)
         self.trace_output = trace_output
         self.__setup_ops()
+        self.trace_count = 0
 
     # run a program that's provided in a string
     # usese the provided Parser found in brewparse.py to parse the program
     # into an abstract syntax tree (ast)
+
+
+    def __print(self, val = ""):
+        if self.trace_output:
+            print(val)
+
+    def __printEnv(self, env):
+        if self.trace_output and env:
+            print("ENV\n===============")
+            for k, v in env:
+                print(f"{k} : {get_printable(v)}")
+                
+            print("===============\n\n")
+
     def run(self, program):
         ast = parse_program(program)
+        self.__print(ast)
         self.__set_up_function_table(ast)
         self.env = EnvironmentManager()
         main_func = self.__get_func_by_name("main", 0)
@@ -49,7 +64,16 @@ class Interpreter(InterpreterBase):
 
     def __get_func_by_name(self, name, num_params):
         if name not in self.func_name_to_ast:
-            closure_val_obj = self.env.get(name)
+            closure_val_obj = None
+            
+            if "." in name:
+                object_name, function_field = name.split('.')
+                closure_val_obj = self.env.get(object_name).value().get_field(function_field)
+                if closure_val_obj == UNDEFINED:
+                    super().error(ErrorType.NAME_ERROR, f"Object {object_name} does not have function {name}")
+
+            else: 
+                closure_val_obj = self.env.get(name)
             if closure_val_obj is None:
                 return None
                 # super().error(ErrorType.NAME_ERROR, f"Function {name} not found")
@@ -60,7 +84,10 @@ class Interpreter(InterpreterBase):
             closure = closure_val_obj.value()
             num_formal_params = len(closure.func_ast.get("args"))
             if num_formal_params != num_params:
-                super().error(ErrorType.TYPE_ERROR, "Invalid # of args to lambda")
+                if "." in name:
+                    super().error(ErrorType.NAME_ERROR, "Invalid # of args to lambda for method call")
+                else:
+                    super().error(ErrorType.TYPE_ERROR, "Invalid # of args to lambda")
             return closure_val_obj.value()
 
         candidate_funcs = self.func_name_to_ast[name]
@@ -88,9 +115,15 @@ class Interpreter(InterpreterBase):
         self.env.push()
         for statement in statements:
             if self.trace_output:
+                print(f"({self.trace_count}):")
                 print(statement)
+                print(self.env.environment)
+                self.__printEnv(self.env)
+                self.trace_count += 1
             status = ExecStatus.CONTINUE
             if statement.elem_type == InterpreterBase.FCALL_DEF:
+                self.__call_func(statement)
+            if statement.elem_type == InterpreterBase.MCALL_DEF:
                 self.__call_func(statement)
             elif statement.elem_type == "=":
                 self.__assign(statement)
@@ -107,6 +140,21 @@ class Interpreter(InterpreterBase):
 
         self.env.pop()
         return (ExecStatus.CONTINUE, Interpreter.NIL_VALUE)
+    
+
+    def __shared_func_block(self, target_closure, func_name, call_ast):
+        if target_closure == None:
+            super().error(ErrorType.NAME_ERROR, f"Function {func_name} not found")
+        if target_closure.type != Type.CLOSURE:
+            super().error(ErrorType.TYPE_ERROR, f"Function {func_name} is changed to non-function type.")
+        target_ast = target_closure.func_ast
+        new_env = {}
+        self.__prepare_env_with_closed_variables(target_closure, new_env)
+        self.__prepare_params(target_ast, call_ast, new_env)
+        self.env.push(new_env)
+        _, return_val = self.__run_statements(target_ast.get("statements"))
+        self.env.pop()
+        return return_val
 
 
     def __call_func(self, call_ast):
@@ -115,27 +163,34 @@ class Interpreter(InterpreterBase):
             return self.__call_print(call_ast)
         if func_name == "inputi":
             return self.__call_input(call_ast)
+        
+        if call_ast.elem_type == InterpreterBase.MCALL_DEF:
+            obj_name = call_ast.get("objref")
+            obj = self.env.get(obj_name)
+            if obj is None:
+                super().error(
+                    ErrorType.NAME_ERROR, f"object {obj_name} not found"
+                )
+            if obj.type() != Type.OBJECT:
+                super().error(
+                    ErrorType.TYPE_ERROR, f"{obj_name} is not an object"
+                )
+            target_closure = obj.value().get_field(func_name)
+            func_name = obj_name + "." + func_name
 
         actual_args = call_ast.get("args")
         target_closure = self.__get_func_by_name(func_name, len(actual_args))
-        if target_closure == None:
-            super().error(ErrorType.NAME_ERROR, f"Function {func_name} not found")
-        if target_closure.type != Type.CLOSURE:
-            super().error(ErrorType.TYPE_ERROR, f"Function {func_name} is changed to non-function type.")
-        target_ast = target_closure.func_ast
-
-        new_env = {}
-        self.__prepare_env_with_closed_variables(target_closure, new_env)
-        self.__prepare_params(target_ast,call_ast, new_env)
-        self.env.push(new_env)
-        _, return_val = self.__run_statements(target_ast.get("statements"))
-        self.env.pop()
-        return return_val
+        return self.__shared_func_block(target_closure, func_name, call_ast)
+        
 
     def __prepare_env_with_closed_variables(self, target_closure, temp_env):
         for var_name, value in target_closure.captured_env:
-            # Updated here - ignore updates to the scope if we
-            #   altered a parameter, or if the argument is a similarly named variable
+            inst = self.env.get(var_name)
+            if type(inst.value()) == Object:
+                continue
+
+            if type(inst.value()) == Closure:
+                continue
             temp_env[var_name] = value
 
 
@@ -150,11 +205,26 @@ class Interpreter(InterpreterBase):
 
         for formal_ast, actual_ast in zip(formal_args, actual_args):
             if formal_ast.elem_type == InterpreterBase.REFARG_DEF:
-                result = self.__eval_expr(actual_ast)
+                print("AHHHHxxx")
+                print(call_ast)
+                if call_ast.elem_type == InterpreterBase.FCALL_DEF:
+                    result = self.__eval_expr(actual_ast)
+                else:
+                    result = copy.copy(self.__eval_expr(actual_ast))
             else:
                 result = copy.deepcopy(self.__eval_expr(actual_ast))
+                
+
+
+               
             arg_name = formal_ast.get("name")
             temp_env[arg_name] = result
+        
+        # if call_ast is a method call, we pass in "this" implicitly
+        if call_ast.elem_type == InterpreterBase.MCALL_DEF:
+            temp_env["this"] = self.env.get(call_ast.get("objref"))
+
+
 
     def __call_print(self, call_ast):
         output = ""
@@ -181,15 +251,38 @@ class Interpreter(InterpreterBase):
 
     def __assign(self, assign_ast):
         var_name = assign_ast.get("name")
-        src_value_obj = copy.copy(self.__eval_expr(assign_ast.get("expression")))
         target_value_obj = self.env.get(var_name)
+        src_value_obj = copy.copy(self.__eval_expr(assign_ast.get("expression")))
+
+        # if variable no exists yet: target = variable, src = value we set varaible to
         if target_value_obj is None:
-            self.env.set(var_name, src_value_obj)
+            # has '.' => changing object field
+            if "." in var_name:
+                object_name, field = var_name.split('.')
+                if self.env.get(object_name) == None:
+                    super().error(ErrorType.NAME_ERROR, f"Variable {object_name} not found")
+                if self.env.get(object_name).type() != Type.OBJECT:
+                    super().error(ErrorType.TYPE_ERROR, "Dot operator used on non-object p")
+                if field == "proto":
+                    if (src_value_obj.type()) != Type.OBJECT and src_value_obj.type() != Type.NIL:
+                        super().error(ErrorType.TYPE_ERROR, "Cannot set proto to non-object")
+                    self.env.get(object_name).value().set_proto(src_value_obj)
+                    
+                else:
+                    self.env.get(object_name).value().set_field(field, src_value_obj)
+                    self.env.set("this", self.env.get(object_name))
+            else:
+                self.env.set(var_name, src_value_obj)
+
+
+        # if variable exists already            
         else:
-                        # if a close is changed to another type such as int, we cannot make function calls on it any more 
+            # if a close is changed to another type such as int, we cannot make function calls on it any more 
             if target_value_obj.t == Type.CLOSURE and src_value_obj.t != Type.CLOSURE:
                 target_value_obj.v.type = src_value_obj.t
             target_value_obj.set(src_value_obj)
+            
+        
 
     def __eval_expr(self, expr_ast):
         if expr_ast.elem_type == InterpreterBase.NIL_DEF:
@@ -204,6 +297,8 @@ class Interpreter(InterpreterBase):
             return self.__eval_name(expr_ast)
         if expr_ast.elem_type == InterpreterBase.FCALL_DEF:
             return self.__call_func(expr_ast)
+        if expr_ast.elem_type == InterpreterBase.MCALL_DEF:
+            return self.__call_func(expr_ast)
         if expr_ast.elem_type in Interpreter.BIN_OPS:
             return self.__eval_op(expr_ast)
         if expr_ast.elem_type == Interpreter.NEG_DEF:
@@ -212,10 +307,41 @@ class Interpreter(InterpreterBase):
             return self.__eval_unary(expr_ast, Type.BOOL, lambda x: not x)
         if expr_ast.elem_type == Interpreter.LAMBDA_DEF:
             return Value(Type.CLOSURE, Closure(expr_ast, self.env))
+        if expr_ast.elem_type == Interpreter.OBJ_DEF:
+            return copy.deepcopy(Value(Type.OBJECT, Object()))
 
     def __eval_name(self, name_ast):
         var_name = name_ast.get("name")
-        val = self.env.get(var_name)
+        val = None
+        if '.' in var_name:
+            obj_name, field = var_name.split(".")
+            object = self.env.get(obj_name)
+            if object is None:
+                super().error(
+                    ErrorType.NAME_ERROR, f"object {obj_name} not found"
+                )
+            if field == "proto":
+                val = self.env.get(obj_name).value().get_proto()
+                if val == None:
+                    super().error(
+                        ErrorType.NAME_ERROR, f"object {obj_name} exist but proto not set yet"
+                    )
+            else:
+                object =  self.env.get(obj_name)  
+                if object.type() != Type.OBJECT:
+                    super().error(
+                        ErrorType.TYPE_ERROR, f"Dot operator used on non-object {obj_name}"
+                    )
+
+                val = object.value().get_field(field)
+                if val is UNDEFINED:
+                    super().error(
+                        ErrorType.NAME_ERROR, f"object {obj_name} exist but field {field} not found"
+                    )
+
+        else:
+            val = self.env.get(var_name)
+
         if val is not None:
             return val
         closure = self.__get_func_by_name(var_name, None)
@@ -377,6 +503,14 @@ class Interpreter(InterpreterBase):
             Type.BOOL, x.value() == y.value()
         )
         self.op_to_lambda[Type.CLOSURE]["!="] = lambda x, y: Value(
+            Type.BOOL, x.value() != y.value()
+        )
+
+        self.op_to_lambda[Type.OBJECT] = {}
+        self.op_to_lambda[Type.OBJECT]["=="] = lambda x, y: Value(
+            Type.BOOL, x.value() == y.value()
+        )
+        self.op_to_lambda[Type.OBJECT]["!="] = lambda x, y: Value(
             Type.BOOL, x.value() != y.value()
         )
 
